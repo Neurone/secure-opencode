@@ -1,0 +1,73 @@
+# Builder stage: compiles the real opencode v2 CLI from the official source
+# (github.com/anomalyco/opencode) at a pinned tag, using the same toolchain
+# and build script (packages/cli/script/build.ts) their own release CI uses.
+# Bun and the full monorepo checkout never make it into the final image --
+# only the resulting single binary does (see the final stage below).
+FROM oven/bun:1.4.2-slim AS builder
+
+ARG OPENCODE_TAG
+ARG OPENCODE_TARGET
+RUN test -n "$OPENCODE_TAG" && test -n "$OPENCODE_TARGET"
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN git clone --depth 1 --branch "$OPENCODE_TAG" https://github.com/anomalyco/opencode.git /build
+WORKDIR /build
+RUN bun install
+
+WORKDIR /build/packages/cli
+# --skip-web-ui: this sandbox only needs the CLI/TUI, not the bundled web UI
+# opencode can also serve; skipping it avoids building that frontend too.
+# script/build.ts names targets "opencode-<os>-<arch>[-baseline][-<abi>]"
+# (see its targetName()) but writes output under "cli-<os>-<arch>...", hence
+# the two different prefixes below for the same $OPENCODE_TARGET suffix.
+#
+# OPENCODE_VERSION is set explicitly because @opencode/script's own version
+# detection falls back to the current git branch name, which is empty here
+# (a --branch tag checkout leaves the clone in detached HEAD).
+RUN OPENCODE_VERSION="${OPENCODE_TAG#v}" bun ./script/build.ts --target="opencode-$OPENCODE_TARGET" --skip-web-ui
+
+# Final stage: the image actually run day to day, same lightweight base as
+# before the switch to building from source.
+FROM node:24-slim
+
+ARG OPENCODE_TAG
+ARG OPENCODE_TARGET
+LABEL org.opencode-sandbox.version="$OPENCODE_TAG"
+
+# The container is meant to be run with an arbitrary host UID (--user), which
+# is not known at build time. Everything under $HOME is therefore assigned to
+# group 0 with the owner's permissions, and the run script adds group 0 as a
+# supplementary group. This is the standard "arbitrary UID" pattern and works
+# identically on Linux and macOS hosts.
+#
+# .config/git is created explicitly *before* the installers run: otherwise it
+# is created by root as 0700 and git fails to read its attributes file,
+# emitting "unable to access '/home/node/.config/git/attributes'" on every
+# single invocation.
+
+# Baked into the global opencode plugin directory rather than mounted from
+# the host: opencode.sh mounts the host's ~/.config/opencode entries as
+# siblings, so this stays untouched as long as the host has no plugins/ dir
+# of its own (see src/container/plugins/sandbox-banner/).
+COPY plugins/sandbox-banner /home/node/.config/opencode/plugins/sandbox-banner
+
+COPY --from=builder /build/packages/cli/dist/cli-${OPENCODE_TARGET}/bin/opencode /usr/local/bin/opencode
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        curl jq git vim tzdata \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /home/node/.config/opencode /home/node/.config/git \
+        /home/node/.local/share/opencode /home/node/.local/state/opencode/latest/tui \
+    && chmod +x /usr/local/bin/opencode \
+    && touch /home/node/.config/git/attributes /home/node/.gitconfig \
+    && chown -R node:0 /home/node \
+    && chmod -R g=u /home/node
+
+USER node
+WORKDIR /workspace
+
+ENTRYPOINT ["opencode"]
