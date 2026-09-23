@@ -1,6 +1,6 @@
 # Secure OpenCode
 
-Runs [opencode](https://opencode.ai) inside a Docker sandbox instead of directly on the host, while still behaving like a normal `opencode` install: same `~/.config/opencode` config, same git identity, same shell workflow.
+Runs [opencode](https://opencode.ai) inside a Docker sandbox instead of directly on the host, while still behaving like a normal `opencode` install: same `~/.config/opencode` config, same git identity (no credentials), same shell workflow. It works standalone, with no native OpenCode install required.
 
 No provider credentials are carried into the container (see [Credentials](#credentials)). This is built with a **local model provider** (LM Studio, Ollama, a local proxy) in mind, which typically needs none anyway. What matters for those is network reachability: `--add-host=host.docker.internal:host-gateway` is always added (see [How it works](#how-it-works) and [Local providers](#local-providers) for the config change this requires).
 
@@ -21,6 +21,9 @@ Each run is also disposable and reproducible: `--rm` plus a pinned toolchain (`s
 - `bash`
 - `jq` (used to read plugin paths out of the opencode config files — the global and project `opencode.json`/`opencode.jsonc`, plus the file pointed to by `OPENCODE_CONFIG` when set — so they can be mounted into the container)
 - [Docker](https://docs.docker.com/get-docker/)
+
+### Optional
+
 - opencode installed natively (`opencode` available in `PATH`) is **optional**: the sandboxed `opencode` is compiled from upstream source inside Docker (see [How it works](#how-it-works)) and needs no native install to run. A native install is only used, if found, to set up the `opencode-original` escape hatch (see [Install](#install) and [Usage](#usage)).
 
 ## Install
