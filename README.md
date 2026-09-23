@@ -21,7 +21,7 @@ Each run is also disposable and reproducible: `--rm` plus a pinned toolchain (`s
 - `bash`
 - `jq` (used to read plugin paths out of the opencode config files — the global and project `opencode.json`/`opencode.jsonc`, plus the file pointed to by `OPENCODE_CONFIG` when set — so they can be mounted into the container)
 - [Docker](https://docs.docker.com/get-docker/)
-- opencode already installed natively (`opencode` available in `PATH`)
+- opencode installed natively (`opencode` available in `PATH`) is **optional**: the sandboxed `opencode` is compiled from upstream source inside Docker (see [How it works](#how-it-works)) and needs no native install to run. A native install is only used, if found, to set up the `opencode-original` escape hatch (see [Install](#install) and [Usage](#usage)).
 
 ## Install
 
@@ -32,10 +32,12 @@ Each run is also disposable and reproducible: `--rm` plus a pinned toolchain (`s
 This will:
 
 1. Check the OS and that Docker is available (warns, doesn't block, if Docker is missing).
-2. Locate the native `opencode` binary via `PATH`.
-3. Create `~/.secure-opencode/bin/`, containing an `opencode-original` symlink to the native binary and an `opencode` symlink to `src/opencode.sh`.
+2. Locate the native `opencode` binary via `PATH`, if there is one.
+3. Create `~/.secure-opencode/bin/`, containing an `opencode` symlink to `src/opencode.sh` and, only if a native binary was found in step 2, an `opencode-original` symlink to it.
 4. Prepend `~/.secure-opencode/bin` to `PATH` in your shell startup files (whichever of `.zshrc`, `.bashrc`, `.bash_profile`, `.profile` already exist; if none exist, the one matching your `$SHELL` is created — `.zshrc` for zsh, `.bash_profile` for bash, `.profile` otherwise), so it resolves before the native install.
 5. Build the `opencode-sandbox` Docker image from `src/container/Dockerfile.opencode`, compiling `opencode` from the latest stable upstream release (see [How it works](#how-it-works)).
+
+No native `opencode` install is required: if step 2 doesn't find one, the script warns and just skips `opencode-original` — the sandboxed `opencode` from step 5 works regardless, since it's built entirely from upstream source inside Docker. Install `opencode` natively and re-run `./install.sh` at any later point to add the `opencode-original` shim.
 
 The native install itself is never touched. The symlink/PATH setup (steps 2-4) is idempotent and skipped when already installed, but the image build in step 5 always runs from scratch. That makes re-running `./install.sh` the supported way to pick up an edit to `Dockerfile.opencode`: `opencode.sh` on its own only rebuilds when a newer stable upstream release is out, not on a local Dockerfile edit (see [How it works](#how-it-works)). If the rebuild on a re-run fails (e.g. you're offline), the script warns and keeps the existing image rather than failing; a fresh install without a working build exits with an error, since there is no image to fall back to. The script refuses to proceed if it finds a state it can't safely resolve on its own (e.g. an `opencode`/`opencode-original` in the shim directory that isn't a symlink it manages), explaining what to check.
 
@@ -49,7 +51,7 @@ opencode
 
 It now runs sandboxed in Docker, with the project directory, your opencode config, and your git identity mounted in.
 
-To use the original, natively installed and **unconstrained** `opencode` binary, invoke `opencode-original` directly:
+If a native `opencode` was found at install time, `opencode-original` is also available to invoke the original, natively installed and **unconstrained** binary directly:
 
 ```bash
 opencode-original
@@ -76,7 +78,7 @@ Removes `~/.secure-opencode/bin` (the `opencode` and `opencode-original` symlink
   - Plugin entries are collected from the global and project `opencode.json`/`opencode.jsonc`, plus the file pointed to by `OPENCODE_CONFIG` when it's set and points somewhere other than those four files (JSONC syntax — comments and trailing commas — is accepted). A plugin the same config lists twice, or that is listed in both the global and the project config, is mounted once. A config file that can't be parsed is reported as a warning and skipped rather than aborting the launch.
 - `--add-host=host.docker.internal:host-gateway` is always added, so a provider pointed at a local server on the host (LM Studio, Ollama, a local proxy) stays reachable from inside the container — but only if your `opencode.json` addresses it as `host.docker.internal` rather than `localhost`/`127.0.0.1` (see [Local providers](#local-providers)).
 - The native opencode install is left completely untouched, and the container's own `opencode` is never compared against it. Instead, `opencode.sh` checks `github.com/anomalyco/opencode` on every launch for the latest stable tag of the major version line pinned in `src/lib/install-common.sh` (`OPENCODE_MAJOR`, currently `2`, i.e. `v2.*` tags, ignoring pre-release/CI tags like `v2.0.0-beta1`). If that's already what the `opencode-sandbox:current` image was last built from, it's reused as-is. If a newer stable release is out, `Dockerfile.opencode`'s `builder` stage clones that tag and compiles it from source with the project's own release build script (`packages/cli/script/build.ts`), and only the resulting binary is copied into the final image — Bun and the full source checkout never end up in the image you actually run. A build failure (network hiccup, upstream breakage) falls back to the last successful local build with a warning instead of failing the run; if there is no previous successful build to fall back to, `opencode.sh` stops rather than run nothing. A stable release of the *next* major version (e.g. `v3.x`) only prints a notice — it's never built automatically, since that'd be a deliberate upgrade decision, not an automatic one.
-- `install.sh` creates `~/.secure-opencode/bin/`, with an `opencode-original` symlink to the native binary and an `opencode` symlink to `src/opencode.sh`, then prepends that directory to `PATH` in your shell startup files. Because it comes first on `PATH`, typing `opencode` anywhere resolves to the sandboxed wrapper instead of the native binary.
+- `install.sh` creates `~/.secure-opencode/bin/`, with an `opencode` symlink to `src/opencode.sh` and, only if a native `opencode` is found on `PATH`, an `opencode-original` symlink to it, then prepends that directory to `PATH` in your shell startup files. Because it comes first on `PATH`, typing `opencode` anywhere resolves to the sandboxed wrapper instead of the native binary.
 - `restore.sh` undoes exactly that: removes the shim directory and the `PATH` entry.
 
 ### Credentials

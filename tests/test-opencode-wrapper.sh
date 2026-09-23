@@ -17,6 +17,18 @@ INSTALL_SH="$REPO_DIR/install.sh"
 RESTORE_SH="$REPO_DIR/restore.sh"
 REAL_GIT="$(command -v git)"
 
+# PATH with every directory that has its own 'opencode' executable stripped
+# out, so S10b (install without a native opencode) is not accidentally
+# satisfied by a real opencode install on the host running these tests.
+PATH_WITHOUT_OPENCODE="$(
+  IFS=':'
+  for dir in $PATH; do
+    [ -n "$dir" ] || continue
+    [ -x "$dir/opencode" ] && continue
+    printf '%s:' "$dir"
+  done
+)"
+
 if [ -z "$REAL_GIT" ]; then
   echo "Error: real git not found in PATH (needed by the fake git for 'git config')." >&2
   exit 1
@@ -500,6 +512,35 @@ else
 fi
 has_pattern "$T/home2/.zshrc" "secure-opencode PATH" "PATH block added to .zshrc (SHELL=/bin/zsh fallback)"
 has_line "$REC/build.args" "OPENCODE_TAG=v2.0.14" "image built during install"
+
+# ---------------------------------------------------------------------------
+# S10b: install.sh fresh install, no native opencode on PATH -> still works
+# ---------------------------------------------------------------------------
+echo "=== S10b: fresh install, no native opencode found ==="
+REC="$T/record/s10b"
+mkdir -p "$T/home2b" "$REC"
+FAKE_TAGS_V2="v2.0.14" FAKE_IMAGE_STATE=absent FAKE_GIT_FAIL=0 FAKE_BUILD_FAIL=0 \
+  env HOME="$T/home2b" \
+      SHELL=/bin/zsh \
+      FAKE_DOCKER_RECORD="$REC" \
+      PATH="$T/bin:$PATH_WITHOUT_OPENCODE" \
+      bash "$INSTALL_SH" >"$REC/stdout.txt" 2>"$REC/stderr.txt"
+rc=$?
+if [ "$rc" = 0 ]; then pass "exit 0"; else fail "exit 0 (got $rc)"; fi
+SHIM_NO_NATIVE="$T/home2b/.secure-opencode/bin"
+if [ -L "$SHIM_NO_NATIVE/opencode" ] && [ "$(readlink -f "$SHIM_NO_NATIVE/opencode")" = "$(readlink -f "$WRAPPER")" ]; then
+  pass "opencode shim links to the wrapper without a native opencode"
+else
+  fail "opencode shim links to the wrapper without a native opencode"
+fi
+if [ -e "$SHIM_NO_NATIVE/opencode-original" ]; then
+  fail "opencode-original NOT created when no native opencode is found"
+else
+  pass "opencode-original NOT created when no native opencode is found"
+fi
+has_pattern "$REC/stderr.txt" "no native 'opencode' command found" "warns instead of failing"
+has_pattern "$T/home2b/.zshrc" "secure-opencode PATH" "PATH block added even without native opencode"
+has_line "$REC/build.args" "OPENCODE_TAG=v2.0.14" "image built during install without native opencode"
 
 # ---------------------------------------------------------------------------
 # S11: install.sh already installed + offline -> warning, not failure

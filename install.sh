@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # Installs the secure-opencode sandbox wrapper so that 'opencode' resolves to it.
 #
-# The native opencode install is left completely untouched, so its own
-# upgrade path keeps working exactly as before. Instead, this creates a
-# dedicated directory (~/.secure-opencode/bin) containing:
+# A native opencode install is optional and, if present, left completely
+# untouched, so its own upgrade path keeps working exactly as before.
+# Instead, this creates a dedicated directory (~/.secure-opencode/bin)
+# containing:
 #   - opencode          -> src/opencode.sh (the Docker sandbox wrapper)
-#   - opencode-original -> the native binary (whatever it currently resolves to)
+#   - opencode-original -> the native binary, only if one is found on PATH
 # and prepends that directory to PATH via the shell startup files, so
 # 'opencode' always resolves to the sandbox wrapper first.
 #
@@ -56,11 +57,17 @@ if [ -d "$SHIM_DIR" ]; then
 fi
 
 # Already fully installed: report and exit without touching anything.
+# opencode-original is optional (it only exists if a native opencode was
+# found on some prior run), so its presence is not part of this check.
 if [ -L "$SHIM_OPENCODE" ] && [ "$(resolve_path "$SHIM_OPENCODE")" = "$WRAPPER_REAL" ] \
-   && [ -L "$SHIM_OPENCODE_ORIGINAL" ] && any_rc_has_path_block; then
+   && any_rc_has_path_block; then
   echo "Already installed:"
   echo "  $SHIM_OPENCODE -> $WRAPPER_SCRIPT"
-  echo "  $SHIM_OPENCODE_ORIGINAL -> $(readlink "$SHIM_OPENCODE_ORIGINAL")"
+  if [ -L "$SHIM_OPENCODE_ORIGINAL" ]; then
+    echo "  $SHIM_OPENCODE_ORIGINAL -> $(readlink "$SHIM_OPENCODE_ORIGINAL")"
+  else
+    echo "  (no native opencode found; 'opencode-original' is not available)"
+  fi
   echo "PATH entry already present in shell startup files."
   # A rebuild failure here (e.g. offline) must not fail the re-run: the
   # installation is complete and the existing image keeps working. A fresh
@@ -80,10 +87,18 @@ if [ -e "$SHIM_OPENCODE_ORIGINAL" ] && [ ! -L "$SHIM_OPENCODE_ORIGINAL" ]; then
   exit 1
 fi
 
-if ! NATIVE_OPENCODE_PATH="$(find_native_opencode "$SHIM_DIR_REAL")"; then
-  echo "Error: no native 'opencode' command found in PATH (outside of $SHIM_DIR)." >&2
-  echo "Install the native opencode CLI first, then re-run this script." >&2
-  exit 1
+# A native opencode install is optional: the sandboxed 'opencode' builds its
+# own opencode from source inside Docker (see src/opencode.sh), so it works
+# with no native binary on PATH at all. When one is found, it's linked as
+# 'opencode-original' purely as a convenience escape hatch to the
+# unsandboxed binary; when it isn't, that shim is simply skipped.
+NATIVE_OPENCODE_PATH=""
+if NATIVE_OPENCODE_PATH="$(find_native_opencode "$SHIM_DIR_REAL")"; then
+  echo "Found native opencode at: $NATIVE_OPENCODE_PATH"
+else
+  NATIVE_OPENCODE_PATH=""
+  echo "Warning: no native 'opencode' command found in PATH; skipping the 'opencode-original' shim." >&2
+  echo "The sandboxed 'opencode' does not need it (see README.md); install opencode natively and re-run install.sh later if you also want direct, unsandboxed access to it." >&2
 fi
 
 if ! mkdir -p "$SHIM_DIR" 2>/dev/null; then
@@ -91,10 +106,10 @@ if ! mkdir -p "$SHIM_DIR" 2>/dev/null; then
   exit 1
 fi
 
-echo "Found native opencode at: $NATIVE_OPENCODE_PATH"
-
-ln -sf "$NATIVE_OPENCODE_PATH" "$SHIM_OPENCODE_ORIGINAL"
-echo "  -> linked: $SHIM_OPENCODE_ORIGINAL -> $NATIVE_OPENCODE_PATH"
+if [ -n "$NATIVE_OPENCODE_PATH" ]; then
+  ln -sf "$NATIVE_OPENCODE_PATH" "$SHIM_OPENCODE_ORIGINAL"
+  echo "  -> linked: $SHIM_OPENCODE_ORIGINAL -> $NATIVE_OPENCODE_PATH"
+fi
 
 ln -sf "$WRAPPER_SCRIPT" "$SHIM_OPENCODE"
 echo "  -> linked: $SHIM_OPENCODE -> $WRAPPER_SCRIPT"
@@ -109,13 +124,29 @@ configure_shell_path
 
 force_rebuild_sandbox_image "$DOCKERFILE" "$CONTAINER_DIR"
 
-cat <<EOF
+if [ -n "$NATIVE_OPENCODE_PATH" ]; then
+  cat <<EOF
 
 Install complete. The native opencode install at $NATIVE_OPENCODE_PATH is untouched,
 so its own updates keep working normally.
 
   $SHIM_OPENCODE          -> $WRAPPER_SCRIPT (sandboxed, runs in Docker)
   $SHIM_OPENCODE_ORIGINAL -> $NATIVE_OPENCODE_PATH (native binary)
+EOF
+else
+  cat <<EOF
+
+Install complete. No native opencode was found, so only the sandboxed wrapper
+was installed:
+
+  $SHIM_OPENCODE -> $WRAPPER_SCRIPT (sandboxed, runs in Docker)
+
+'opencode-original' is not available. Install opencode natively and re-run
+install.sh later if you also want direct, unsandboxed access to it.
+EOF
+fi
+
+cat <<EOF
 
 Start a new shell (or run 'source <rc file>' / 'export PATH="$SHIM_DIR:\$PATH"') for
 'opencode' to resolve to the sandbox wrapper in your current session.
