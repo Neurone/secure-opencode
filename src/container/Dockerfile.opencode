@@ -48,26 +48,40 @@ LABEL org.opencode-sandbox.version="$OPENCODE_TAG"
 # emitting "unable to access '/home/node/.config/git/attributes'" on every
 # single invocation.
 
-# Baked into the global opencode plugin directory rather than mounted from
-# the host: opencode.sh mounts the host's ~/.config/opencode entries as
-# siblings, so this stays untouched as long as the host has no plugins/ dir
-# of its own (see src/container/plugins/sandbox-banner/).
-COPY plugins/sandbox-banner /home/node/.config/opencode/plugins/sandbox-banner
+# The "you are in a sandbox" banner plugin, baked to /opt rather than under
+# /home/node: the config dir is bind-mounted whole from the host by
+# src/opencode.sh, which would shadow anything baked under it -- and writing
+# into it would publish the banner to a native opencode on the host too. The
+# entrypoint declares /opt/sandbox-banner through OPENCODE_CONFIG_CONTENT at
+# startup instead (see src/container/entrypoint.sh).
+COPY plugins/sandbox-banner /opt/sandbox-banner
+
+# Container entrypoint: per-run service-file cleanup, banner declaration,
+# signal forwarding, status propagation (see src/container/entrypoint.sh).
+COPY entrypoint.sh /usr/local/bin/opencode-sandbox-entrypoint
 
 COPY --from=builder /build/packages/cli/dist/cli-${OPENCODE_TARGET}/bin/opencode /usr/local/bin/opencode
 
+# The four opencode dirs are bind-mounted whole from the host, so their
+# in-image content only matters for a direct docker run on a host where the
+# matching dirs do not exist yet (they become the starting point, then get
+# shadowed by the mounts). They are created here so such a run finds them.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         curl jq git vim tzdata \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /home/node/.config/opencode /home/node/.config/git \
-        /home/node/.local/share/opencode /home/node/.local/state/opencode/latest/tui \
-    && chmod +x /usr/local/bin/opencode \
+        /home/node/.local/share/opencode /home/node/.local/state/opencode \
+        /home/node/.cache/opencode \
+    && chmod +x /usr/local/bin/opencode /usr/local/bin/opencode-sandbox-entrypoint \
     && touch /home/node/.config/git/attributes /home/node/.gitconfig \
-    && chown -R node:0 /home/node \
+    && chown -R node:0 /home/node /opt/sandbox-banner \
     && chmod -R g=u /home/node
 
 USER node
 WORKDIR /workspace
 
-ENTRYPOINT ["opencode"]
+# The wrapper always runs the container with -e HOME=/home/node, so the
+# entrypoint's $HOME-relative dirs resolve to the mount points the RUN above
+# created (see src/container/entrypoint.sh).
+ENTRYPOINT ["/usr/local/bin/opencode-sandbox-entrypoint"]

@@ -82,10 +82,10 @@ mkdir -p \
   "$T/bin" \
   "$T/native" \
   "$T/home/.config/opencode/agents" \
+  "$T/home/.config/opencode/cfgplugin" \
   "$T/home/.local/share/opencode/log" \
   "$T/home/.local/state/opencode/locks" \
-  "$T/home/.local/state/opencode/latest/locks" \
-  "$T/home/.local/state/opencode/latest/tui" \
+  "$T/home/.cache/opencode/npm" \
   "$T/project" \
   "$T/plugins" \
   "$T/record"
@@ -202,32 +202,45 @@ chmod +x "$T/bin/git"
 printf '#!/usr/bin/env bash\necho "native opencode"\n' > "$T/native/opencode"
 chmod +x "$T/native/opencode"
 
-# --- host fixtures: config / data / state dirs ------------------------------
+# --- host fixtures: config / data / state / cache dirs -----------------------
+# Global config, v2 "plugins" key: an external dir, a {package, options}
+# object entry inside the config dir, and a path that does not exist.
 cat > "$T/home/.config/opencode/opencode.json" <<EOF
 {
-  "plugin": [
-    "$T/plugins/ext-global.js",
-    ["$T/home/.config/opencode/cfgplugin.js", "opt"],
-    "$T/plugins/missing-plugin.js"
+  "plugins": [
+    "$T/plugins/ext-global",
+    {"package": "$T/home/.config/opencode/cfgplugin", "options": {"opt": 1}},
+    "$T/plugins/missing-plugin"
   ]
 }
 EOF
-echo "cfg plugin" > "$T/home/.config/opencode/cfgplugin.js"
+echo "cfg plugin" > "$T/home/.config/opencode/cfgplugin/index.js"
 echo "service pw" > "$T/home/.config/opencode/service.json"
+# v2's CLI/TUI settings file (theme, keybinds, the plugins list 'plugin add'
+# records); it lives in the config dir and is part of the whole-dir mount.
+cat > "$T/home/.config/opencode/cli.json" <<'EOF'
+{
+  "theme": "tokyo-night"
+}
+EOF
 echo "agent" > "$T/home/.config/opencode/agents/agent1.md"
 
+# Data dir: the session database plus the v1-style credentials file; all of
+# it rides along inside the whole-dir mount (see README.md, Credentials).
 echo "creds" > "$T/home/.local/share/opencode/auth.json"
 echo "db" > "$T/home/.local/share/opencode/opencode.db"
 echo "wal" > "$T/home/.local/share/opencode/opencode.db-wal"
 echo "log" > "$T/home/.local/share/opencode/log/session1.log"
 
-echo "profile" > "$T/home/.local/state/opencode/profile.json"
+# State dir, v2 layout: the background-service registration (with its pty
+# handoff sidecar), the file locks, and an ordinary state file that the
+# entrypoint must leave alone.
 echo "service pw" > "$T/home/.local/state/opencode/service.json"
+echo "pty" > "$T/home/.local/state/opencode/service.json.pty-handoff"
+echo "kv" > "$T/home/.local/state/opencode/kv.json"
 echo "lock" > "$T/home/.local/state/opencode/locks/l1"
-echo "machines" > "$T/home/.local/state/opencode/latest/machines.json"
-echo "lock" > "$T/home/.local/state/opencode/latest/locks/l2"
-echo "tabs" > "$T/home/.local/state/opencode/latest/tui/tabs.json"
-echo "theme" > "$T/home/.local/state/opencode/latest/tui/theme.json"
+
+echo "npm cache" > "$T/home/.cache/opencode/npm/pkgsomeplugin"
 
 cat > "$T/home/.gitconfig" <<'EOF'
 [user]
@@ -238,15 +251,17 @@ cat > "$T/home/.gitconfig" <<'EOF'
 EOF
 
 # --- project fixture: JSONC on purpose (comments + trailing commas) ---------
-# "ext-global.js" is deliberately referenced in BOTH this file and the global
-# opencode.json, to check the wrapper does not mount it twice.
+# "ext-global" is deliberately referenced in BOTH this file and the global
+# opencode.json, to check the wrapper does not mount it twice. The v1-style
+# "plugin" key is kept on purpose: v2 still decodes it, and the wrapper must.
 cat > "$T/project/opencode.jsonc" <<EOF
 {
   // project-level config
   "plugin": [
-    "$T/plugins/ext-global.js",
-    "$T/plugins/proj-ext.js", /* block comment mid-array */
+    "$T/plugins/ext-global",
+    "$T/plugins/proj-ext", /* block comment mid-array */
     "./relative-plugin.js", // relative entries need no mount
+    "@scope/npm-plugin", // npm names install into the cache dir; nothing to mount
   ],
   "provider": {
     "lmstudio": {
@@ -259,9 +274,13 @@ cat > "$T/project/opencode.jsonc" <<EOF
 EOF
 echo "main" > "$T/project/main.txt"
 
-# --- external plugin files (absolute paths outside config + project dirs) ---
-echo "global ext" > "$T/plugins/ext-global.js"
-echo "proj ext" > "$T/plugins/proj-ext.js"
+# --- external plugins (absolute paths outside config + project dirs) --------
+# Directories, as v2 loads them (a bare file entry is rejected upstream with
+# a warning; the wrapper still mounts a found file, and ext-config.js below
+# exercises exactly that branch via the OPENCODE_CONFIG fixture).
+mkdir -p "$T/plugins/ext-global" "$T/plugins/proj-ext"
+echo "global ext" > "$T/plugins/ext-global/index.js"
+echo "proj ext" > "$T/plugins/proj-ext/index.js"
 echo "cfg ext" > "$T/plugins/ext-config.js"
 
 # --- OPENCODE_CONFIG fixture: extra config file outside both dirs -----------
@@ -281,13 +300,39 @@ for candidate in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle
   if [ -s "$candidate" ]; then CA_BUNDLE_CANDIDATE="$candidate"; break; fi
 done
 
+# Whether src/opencode.sh adds a CA-bundle mount. The Linux candidates above
+# find nothing on macOS, where the wrapper exports the keychain trust store
+# into a tmpdir of its own instead, so the check is mirrored here to keep the
+# mount allowlist in S1 exact on both platforms.
+expect_ca_bundle_mount() {
+  case "$(uname -s)" in
+    Darwin)
+      command -v security >/dev/null 2>&1 || return 1
+      local exported
+      exported="$(mktemp)"
+      if { security find-certificate -a -p /System/Library/Keychains/SystemRootCertificates.keychain \
+               security find-certificate -a -p /Library/Keychains/System.keychain; } >"$exported" 2>/dev/null \
+         && [ -s "$exported" ]; then
+        rm -f "$exported"
+        return 0
+      fi
+      rm -f "$exported"
+      return 1
+      ;;
+    *)
+      [ -n "$CA_BUNDLE_CANDIDATE" ]
+      ;;
+  esac
+}
+
 # ---------------------------------------------------------------------------
 # Run helpers
 # ---------------------------------------------------------------------------
 
 # run_wrapper <record-dir> [wrapper args...]
 # Runs the wrapper from the fixture project dir with a controlled environment.
-# FAKE_* / OPENCODE_CONFIG env vars set by the caller are forwarded.
+# FAKE_* / OPENCODE_CONFIG / WRAPPER_HOME env vars set by the caller are
+# forwarded (WRAPPER_HOME overrides the default $T/home fixture home).
 run_wrapper() {
   local record="$1"
   shift
@@ -296,7 +341,7 @@ run_wrapper() {
         "$record"/gitconfig-credential-count "$record"/stdout.txt "$record"/stderr.txt
   (
     cd "$T/project" || exit 99
-    env HOME="$T/home" \
+    env HOME="${WRAPPER_HOME:-$T/home}" \
         SHELL=/bin/zsh \
         TZ=Europe/Rome \
         XDG_CONFIG_HOME= XDG_DATA_HOME= XDG_STATE_HOME= \
@@ -340,16 +385,15 @@ rc=$?
 if [ "$rc" = 0 ]; then pass "exit 0"; else fail "exit 0 (got $rc)"; fi
 if [ -e "$REC/build.args" ]; then fail "no image build"; else pass "no image build"; fi
 has_line "$REC/run.args" "-v $T/project:$T/project$MOUNT_SUFFIX" "project dir mounted"
-has_line "$REC/run.args" "-v $T/home/.config/opencode/agents:/home/node/.config/opencode/agents" "config sibling: agents/"
-has_line "$REC/run.args" "-v $T/home/.config/opencode/cfgplugin.js:/home/node/.config/opencode/cfgplugin.js" "config sibling: loose file"
-has_line "$REC/run.args" "-v $T/home/.config/opencode/opencode.json:/home/node/.config/opencode/opencode.json:ro" "global opencode.json mounted read-only"
-has_line "$REC/run.args" "-v $T/home/.local/share/opencode/log:/home/node/.local/share/opencode/log" "data sibling: log/"
-has_line "$REC/run.args" "-v $T/home/.local/state/opencode/profile.json:/home/node/.local/state/opencode/profile.json" "state sibling: top-level file"
-has_line "$REC/run.args" "-v $T/home/.local/state/opencode/latest/machines.json:/home/node/.local/state/opencode/latest/machines.json" "state latest/ sibling"
-has_line "$REC/run.args" "-v $T/home/.local/state/opencode/latest/tui/theme.json:/home/node/.local/state/opencode/latest/tui/theme.json" "state latest/tui/ sibling"
-has_line "$REC/run.args" "-v $T/plugins/ext-global.js:$T/plugins/ext-global.js:ro" "external plugin (global config) mounted read-only"
-has_line "$REC/run.args" "-v $T/plugins/proj-ext.js:$T/plugins/proj-ext.js:ro" "external plugin (project JSONC config) mounted read-only"
-occurs_once "$REC/run.args" "-v $T/plugins/ext-global.js:$T/plugins/ext-global.js:ro" "plugin referenced in two configs mounted exactly once"
+has_line "$REC/run.args" "-v $T/home/.config/opencode:/home/node/.config/opencode" "config dir mounted whole"
+has_line "$REC/run.args" "-v $T/home/.local/share/opencode:/home/node/.local/share/opencode" "data dir mounted whole"
+has_line "$REC/run.args" "-v $T/home/.local/state/opencode:/home/node/.local/state/opencode" "state dir mounted whole"
+has_line "$REC/run.args" "-v $T/home/.cache/opencode:/home/node/.cache/opencode" "cache dir mounted whole"
+has_line "$REC/run.args" "-v $T/home/.config/opencode/opencode.json:/home/node/.config/opencode/opencode.json:ro" "global opencode.json overlaid read-only"
+has_no_line "$REC/run.args" "-v $T/home/.config/opencode/opencode.jsonc:/home/node/.config/opencode/opencode.jsonc:ro" "no overlay where the host file is absent"
+has_line "$REC/run.args" "-v $T/plugins/ext-global:$T/plugins/ext-global:ro" "external plugin dir (global config) mounted read-only"
+has_line "$REC/run.args" "-v $T/plugins/proj-ext:$T/plugins/proj-ext:ro" "external plugin dir (project JSONC config) mounted read-only"
+occurs_once "$REC/run.args" "-v $T/plugins/ext-global:$T/plugins/ext-global:ro" "plugin referenced in two configs mounted exactly once"
 has_line "$REC/run.args" "-e TZ=Europe/Rome" "TZ forwarded"
 has_line "$REC/run.args" "-e HOME=/home/node" "HOME overridden"
 has_line "$REC/run.args" "-e OPENCODE_LMSTUDIO_BASEURL=http://host.docker.internal:1234/v1" "OPENCODE_LMSTUDIO_BASEURL set"
@@ -357,18 +401,31 @@ has_line "$REC/run.args" "--add-host=host.docker.internal:host-gateway" "host.do
 has_line "$REC/run.args" "opencode-sandbox:current" "image reference"
 has_line "$REC/run.args" "--version" "arguments passed through"
 has_pattern "$REC/run.args" '^-v /[^:]+:/home/node/\.gitconfig:ro$' "filtered gitconfig mounted read-only"
-if [ -n "$CA_BUNDLE_CANDIDATE" ]; then
-  has_line "$REC/run.args" "-v $CA_BUNDLE_CANDIDATE:/etc/ssl/certs/ca-certificates.crt:ro" "host CA bundle mounted"
-fi
 content_is "$REC/gitconfig-credential-count" "0" "gitconfig credential section stripped"
-has_no_pattern "$REC/run.args" 'auth\.json' "auth.json NOT mounted"
-has_no_pattern "$REC/run.args" 'opencode\.db' "opencode.db* NOT mounted"
-has_no_pattern "$REC/run.args" 'service\.json' "service.json NOT mounted"
-has_no_pattern "$REC/run.args" '/locks' "locks/ NOT mounted"
-has_no_pattern "$REC/run.args" 'tabs\.json' "latest/tui/tabs.json NOT mounted"
+# The mount list is the allowlist: exactly the expected set, nothing else.
+# The sensitive files (auth.json, opencode.db*, service.json, cli.json,
+# locks/...) ride along inside the whole-dir mounts by design (README.md,
+# Credentials); no sensitive file is ever mounted per-file.
+if expect_ca_bundle_mount; then
+  EXPECTED_MOUNTS=10
+  if [ "$(uname -s)" = "Darwin" ]; then
+    has_pattern "$REC/run.args" '^-v .*ca-certificates\.crt:/etc/ssl/certs/ca-certificates\.crt:ro$' "host CA bundle mounted (from the macOS keychain)"
+  else
+    has_line "$REC/run.args" "-v $CA_BUNDLE_CANDIDATE:/etc/ssl/certs/ca-certificates.crt:ro" "host CA bundle mounted"
+  fi
+else
+  EXPECTED_MOUNTS=9
+  has_no_pattern "$REC/run.args" 'ca-certificates\.crt' "no CA bundle mount"
+fi
+ACTUAL_MOUNTS=$(grep -c '^-v ' "$REC/run.args")
+if [ "$ACTUAL_MOUNTS" = "$EXPECTED_MOUNTS" ]; then
+  pass "mount list is exactly the expected allowlist ($ACTUAL_MOUNTS mounts)"
+else
+  fail "mount list is exactly the expected allowlist (got $ACTUAL_MOUNTS, expected $EXPECTED_MOUNTS)"
+fi
 has_no_pattern "$REC/run.args" 'missing-plugin' "missing plugin NOT mounted"
-has_pattern "$REC/stderr.txt" "Plugin files available in the container" "plugin manifest printed"
-has_pattern "$REC/stderr.txt" "missing-plugin\.js" "missing plugin warned about"
+has_pattern "$REC/stderr.txt" "Plugin entries available in the container" "plugin manifest printed"
+has_pattern "$REC/stderr.txt" "missing-plugin" "missing plugin warned about"
 
 # ---------------------------------------------------------------------------
 # S2: newer upstream release -> build then run (numeric tag sort check)
@@ -444,6 +501,7 @@ FAKE_TAGS_V2="v2.0.14" FAKE_IMAGE_VERSION="v2.0.14" FAKE_GIT_FAIL=0 FAKE_BUILD_F
 rc=$?
 if [ "$rc" = 0 ]; then pass "exit 0"; else fail "exit 0 (got $rc)"; fi
 has_line "$REC/run.args" "-v $T/custom-oc.json:$T/custom-oc.json:ro" "OPENCODE_CONFIG file mounted read-only"
+has_line "$REC/run.args" "-e OPENCODE_CONFIG=$T/custom-oc.json" "OPENCODE_CONFIG forwarded to container"
 has_line "$REC/run.args" "-v $T/plugins/ext-config.js:$T/plugins/ext-config.js:ro" "plugin from OPENCODE_CONFIG mounted"
 
 # Baseline run (no extra args, no OPENCODE_CONFIG) to compare against.
@@ -451,19 +509,27 @@ REC="$T/record/s7a"
 FAKE_TAGS_V2="v2.0.14" FAKE_IMAGE_VERSION="v2.0.14" FAKE_GIT_FAIL=0 FAKE_BUILD_FAIL=0 \
   OPENCODE_CONFIG= run_wrapper "$REC"
 
-# OPENCODE_CONFIG pointing at the global opencode.json must not add mounts
-# or re-collect plugins (it is already covered by the explicit handling).
+# OPENCODE_CONFIG pointing at the global opencode.json adds the env-var
+# forward but no mounts and no plugin re-collection (the file is inside the
+# mounted config dir), so compare the mount lines only.
 REC="$T/record/s7b"
 FAKE_TAGS_V2="v2.0.14" FAKE_IMAGE_VERSION="v2.0.14" FAKE_GIT_FAIL=0 FAKE_BUILD_FAIL=0 \
   OPENCODE_CONFIG="$T/home/.config/opencode/opencode.json" run_wrapper "$REC"
 rc=$?
 if [ "$rc" = 0 ]; then pass "exit 0"; else fail "exit 0 (got $rc)"; fi
+has_line "$REC/run.args" "-e OPENCODE_CONFIG=$T/home/.config/opencode/opencode.json" "OPENCODE_CONFIG forwarded to container"
+# Normalizes the volatile mount sources (the wrapper's per-run tmpdir paths)
+# so two runs' mount lists can be compared. Reads the list on stdin, as both
+# sides of the comparison below pipe it through: taking it from "$1" instead
+# would be an unbound variable under `set -u` here (this runs inside a
+# pipeline, no argument is passed) and its empty output made the diff compare
+# nothing with nothing.
 norm() { sed -E -e 's#^-v [^:]+:/home/node/\.gitconfig:ro$#-v GITCFG:/home/node/.gitconfig:ro#' \
-                -e 's#^-v [^:]+(/[^:]*)?/ca-certificates\.crt:#-v CACERTS:\1/ca-certificates.crt:#' "$1"; }
-if diff <(norm "$REC/run.args") <(norm "$T/record/s7a/run.args") >/dev/null 2>&1; then
-  pass "OPENCODE_CONFIG at global config adds nothing"
+                -e 's#^-v [^:]+(/[^:]*)?/ca-certificates\.crt:#-v CACERTS:\1/ca-certificates.crt:#'; }
+if diff <(grep '^-v ' "$REC/run.args" | norm) <(grep '^-v ' "$T/record/s7a/run.args" | norm) >/dev/null 2>&1; then
+  pass "OPENCODE_CONFIG at global config adds no mounts"
 else
-  fail "OPENCODE_CONFIG at global config adds nothing"
+  fail "OPENCODE_CONFIG at global config adds no mounts"
 fi
 
 # ---------------------------------------------------------------------------
@@ -591,6 +657,182 @@ run_restore "$REC" "$T/home4"
 rc=$?
 if [ "$rc" = 1 ]; then pass "exit 1"; else fail "exit 1 (got $rc)"; fi
 has_pattern "$REC/stderr.txt" "Nothing to restore" "refusal message"
+
+# ---------------------------------------------------------------------------
+# S15: host config dir without cli.json -> nothing special to do (the config
+# dir is mounted whole anyway; v2 creates the file in the container if needed)
+# ---------------------------------------------------------------------------
+echo "=== S15: no host cli.json, config dir still mounted whole ==="
+mkdir -p "$T/home-nocli/.config/opencode"
+echo '{}' > "$T/home-nocli/.config/opencode/opencode.json"
+REC="$T/record/s15"
+FAKE_TAGS_V2="v2.0.14" FAKE_IMAGE_VERSION="v2.0.14" FAKE_GIT_FAIL=0 FAKE_BUILD_FAIL=0 \
+  OPENCODE_CONFIG= WRAPPER_HOME="$T/home-nocli" run_wrapper "$REC"
+rc=$?
+if [ "$rc" = 0 ]; then pass "exit 0"; else fail "exit 0 (got $rc)"; fi
+has_line "$REC/run.args" "-v $T/home-nocli/.config/opencode/opencode.json:/home/node/.config/opencode/opencode.json:ro" "config dir still processed"
+has_no_pattern "$REC/run.args" 'cli\.json' "no cli.json line anywhere (it rides along inside the whole-dir mount)"
+
+# ---------------------------------------------------------------------------
+# S16: container entrypoint: startup/exit service-file cleanup, banner
+# declaration through OPENCODE_CONFIG_CONTENT, argument passthrough, stdin
+# inheritance, signal forwarding, status propagation
+# ---------------------------------------------------------------------------
+echo "=== S16: entrypoint cleanup, banner, run loop, signals ==="
+ENTRYPOINT="$REPO_DIR/src/container/entrypoint.sh"
+T16="$T/entry"
+mkdir -p "$T16/home/.config/opencode" \
+         "$T16/home/.local/share/opencode" \
+         "$T16/home/.local/state/opencode/locks" \
+         "$T16/home/.cache/opencode" \
+         "$T16/bin" "$T16/banner-src" "$T16/nohome/home" \
+         "$T16/record/s16" "$T16/record/s16content" \
+         "$T16/record/s16sig" "$T16/record/s16nobanner" "$T16/record/s16stdin"
+
+# The state dir as left by a native host run: the registration in both
+# channel forms, its sidecars, the locks, and an ordinary file that must
+# survive the cleanup.
+echo "host reg"  > "$T16/home/.local/state/opencode/service.json"
+echo "host reg2" > "$T16/home/.local/state/opencode/service-2.json"
+echo "sidecar"   > "$T16/home/.local/state/opencode/service.json.pty-handoff"
+echo "tmp"       > "$T16/home/.local/state/opencode/service.json.tmp"
+echo "lock"      > "$T16/home/.local/state/opencode/locks/l1"
+echo "kv"        > "$T16/home/.local/state/opencode/kv.json"
+# The config dir: the service CONFIG (hostname/port/password, kept) and the
+# CLI settings file (kept; the config dir is mounted whole and writable).
+echo "pw" > "$T16/home/.config/opencode/service.json"
+printf '{"theme":"host-theme"}\n' > "$T16/home/.config/opencode/cli.json"
+# The banner as baked into the image; the test points the entrypoint at it.
+echo "idx" > "$T16/banner-src/index.js"
+echo "tui" > "$T16/banner-src/tui.js"
+
+cat > "$T16/bin/opencode" <<'FAKE'
+#!/usr/bin/env bash
+echo "opencode-args: $*"
+printf 'running' > "${FAKE_OPENCODE_MARKER:-/dev/null}"
+if [ -n "${FAKE_OPENCODE_REGISTER:-}" ]; then
+  echo "container reg" > "$FAKE_OPENCODE_REGISTER"
+fi
+if [ -n "${FAKE_OPENCODE_ENV_RECORD:-}" ]; then
+  env | grep '^OPENCODE_CONFIG_CONTENT=' > "$FAKE_OPENCODE_ENV_RECORD"
+fi
+if [ "${FAKE_OPENCODE_STDIN:-}" = 1 ]; then
+  IFS= read -r line && echo "child-stdin:$line"
+fi
+if [ "${FAKE_OPENCODE_EXIT:-}" = 1 ]; then
+  exit "${FAKE_OPENCODE_EXIT_CODE:-0}"
+fi
+trap 'echo "child-term"; exit 143' TERM
+trap 'echo "child-int"; exit 130' INT
+while :; do sleep 1; done
+FAKE
+chmod +x "$T16/bin/opencode"
+
+# A normal run: the child re-registers the service (as the real opencode
+# would), then exits; the entrypoint must propagate 0 and clean up.
+FAKE_OPENCODE_EXIT=1 FAKE_OPENCODE_EXIT_CODE=0 \
+FAKE_OPENCODE_MARKER="$T16/child-marker" \
+FAKE_OPENCODE_REGISTER="$T16/home/.local/state/opencode/service.json" \
+FAKE_OPENCODE_ENV_RECORD="$T16/record/s16/content-env" \
+SECURE_OPENCODE_BANNER_SRC="$T16/banner-src" \
+  env HOME="$T16/home" PATH="$T16/bin:$PATH" \
+  sh "$ENTRYPOINT" run --print-logs >"$T16/record/s16/stdout.txt" 2>"$T16/record/s16/stderr.txt"
+rc=$?
+if [ "$rc" = 0 ]; then pass "exit 0"; else fail "exit 0 (got $rc)"; fi
+has_line "$T16/record/s16/stdout.txt" "opencode-args: run --print-logs" "arguments passed through to opencode"
+for f in service.json service-2.json service.json.pty-handoff service.json.tmp; do
+  if [ -e "$T16/home/.local/state/opencode/$f" ]; then
+    fail "registration files removed (startup + exit cleanup): $f"
+  else
+    pass "registration files removed (startup + exit cleanup): $f"
+  fi
+done
+if [ -e "$T16/home/.local/state/opencode/locks" ]; then
+  fail "locks/ removed (startup + exit cleanup)"
+else
+  pass "locks/ removed (startup + exit cleanup)"
+fi
+content_is "$T16/home/.local/state/opencode/kv.json" "kv" "ordinary state file kept"
+content_is "$T16/home/.config/opencode/service.json" "pw" "service config (config dir) kept"
+content_is "$T16/home/.config/opencode/cli.json" '{"theme":"host-theme"}' "cli.json untouched"
+# The config dir is the host's (mounted whole): the banner must not be
+# written into it, or a native opencode would show the sandbox banner too.
+if [ -e "$T16/home/.config/opencode/plugins/sandbox-banner" ] || [ -e "$T16/home/.config/opencode/plugins/.sandbox-banner" ]; then
+  fail "no banner file written into the config dir"
+else
+  pass "no banner file written into the config dir"
+fi
+content_is "$T16/record/s16/content-env" "OPENCODE_CONFIG_CONTENT={\"plugins\":[\"$T16/banner-src\"]}" "banner declared through OPENCODE_CONFIG_CONTENT"
+has_no_pattern "$T16/record/s16/stderr.txt" "Error" "no errors on a clean start"
+
+# The child must inherit the entrypoint's stdin: a POSIX shell redirects an
+# asynchronous command from /dev/null, which would leave the TUI unable to
+# read a single terminal reply (the tty then echoes the replies back as raw
+# escape sequences, and mouse reports with them).
+FAKE_OPENCODE_EXIT=1 FAKE_OPENCODE_EXIT_CODE=0 FAKE_OPENCODE_STDIN=1 \
+SECURE_OPENCODE_BANNER_SRC="$T16/banner-src" \
+  env HOME="$T16/home" PATH="$T16/bin:$PATH" \
+  sh "$ENTRYPOINT" run <<< "hello-stdin" \
+  >"$T16/record/s16stdin/stdout.txt" 2>"$T16/record/s16stdin/stderr.txt"
+rc=$?
+if [ "$rc" = 0 ]; then pass "exit 0 with a piped stdin"; else fail "exit 0 with a piped stdin (got $rc)"; fi
+has_line "$T16/record/s16stdin/stdout.txt" "child-stdin:hello-stdin" "child inherits the entrypoint's stdin"
+
+# A content config the caller set itself (`docker run -e
+# OPENCODE_CONFIG_CONTENT=...`) must survive: the banner is appended to its
+# plugin list, never substituted for it.
+FAKE_OPENCODE_EXIT=1 FAKE_OPENCODE_MARKER= \
+FAKE_OPENCODE_ENV_RECORD="$T16/record/s16content/content-env" \
+SECURE_OPENCODE_BANNER_SRC="$T16/banner-src" \
+  env HOME="$T16/home" PATH="$T16/bin:$PATH" \
+      OPENCODE_CONFIG_CONTENT='{"plugins":["/host/plugin"],"theme":"x"}' \
+  sh "$ENTRYPOINT" serve >"$T16/record/s16content/stdout.txt" 2>"$T16/record/s16content/stderr.txt"
+rc=$?
+if [ "$rc" = 0 ]; then pass "exit 0 with a caller-provided OPENCODE_CONFIG_CONTENT"; else fail "exit 0 with a caller-provided OPENCODE_CONFIG_CONTENT (got $rc)"; fi
+expected_content="OPENCODE_CONFIG_CONTENT={\"plugins\":[\"/host/plugin\",\"$T16/banner-src\"],\"theme\":\"x\"}"
+content_is "$T16/record/s16content/content-env" "$expected_content" "caller content config kept, banner appended"
+has_no_pattern "$T16/record/s16content/stderr.txt" "Error" "no errors when merging the banner"
+
+# Signal forwarding: the entrypoint is running with a child that stays up
+# until signalled; SIGTERM on the entrypoint must reach the child, and the
+# child's status (143) must come back as the entrypoint's exit code.
+rm -f "$T16/child-marker"
+FAKE_OPENCODE_MARKER="$T16/child-marker" \
+FAKE_OPENCODE_REGISTER="$T16/home/.local/state/opencode/service.json" \
+SECURE_OPENCODE_BANNER_SRC="$T16/banner-src" \
+  env HOME="$T16/home" PATH="$T16/bin:$PATH" \
+  sh "$ENTRYPOINT" run --slow >"$T16/record/s16sig/stdout.txt" 2>"$T16/record/s16sig/stderr.txt" &
+entry_pid=$!
+i=0
+while [ ! -f "$T16/child-marker" ] && [ "$i" -lt 100 ]; do
+  i=$((i + 1))
+  sleep 0.1
+done
+if [ -f "$T16/child-marker" ]; then pass "child came up"; else fail "child came up"; fi
+kill -TERM "$entry_pid"
+wait "$entry_pid"
+rc=$?
+if [ "$rc" = 143 ]; then
+  pass "SIGTERM forwarded, child status 143 propagated"
+else
+  fail "SIGTERM forwarded, child status 143 propagated (got $rc)"
+fi
+has_pattern "$T16/record/s16sig/stdout.txt" "child-term" "child received the signal"
+if [ -e "$T16/home/.local/state/opencode/service.json" ]; then
+  fail "exit cleanup removed the child's registration after the signal"
+else
+  pass "exit cleanup removed the child's registration after the signal"
+fi
+
+# A banner source that is not there (a corrupted image): the sandbox
+# indicator would be missing, so the entrypoint refuses to start.
+FAKE_OPENCODE_EXIT=1 \
+  env HOME="$T16/nohome/home" PATH="$T16/bin:$PATH" \
+  SECURE_OPENCODE_BANNER_SRC="$T16/no-such-banner" \
+  sh "$ENTRYPOINT" run >"$T16/record/s16nobanner/stdout.txt" 2>"$T16/record/s16nobanner/stderr.txt"
+rc=$?
+if [ "$rc" = 1 ]; then pass "exit 1 when the banner source is missing"; else fail "exit 1 when the banner source is missing (got $rc)"; fi
+has_pattern "$T16/record/s16nobanner/stderr.txt" "sandbox banner source" "clear refusal message"
 
 # ---------------------------------------------------------------------------
 # Summary
