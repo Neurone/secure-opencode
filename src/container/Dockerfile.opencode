@@ -68,7 +68,7 @@ COPY --from=builder /build/packages/cli/dist/cli-${OPENCODE_TARGET}/bin/opencode
 # shadowed by the mounts). They are created here so such a run finds them.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        curl jq git vim tzdata \
+        curl python3 jq git vim tzdata shellcheck \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /home/node/.config/opencode /home/node/.config/git \
         /home/node/.local/share/opencode /home/node/.local/state/opencode \
