@@ -1,5 +1,9 @@
 # Secure OpenCode
 
+| ⚠️ WARNING ⚠️ |
+| --- |
+| USE [SECURE AI](https://github.com/Neurone/secure-ai) INSTEAD OF THIS REPOSITORY. THIS REPOSITORY REMAINS HERE SOLELY FOR ARCHIVAL PURPOSES. |
+
 Runs [opencode](https://opencode.ai) inside a Docker sandbox instead of directly on the host, while still behaving like a normal `opencode` install: same config, same sessions, same git identity, same shell workflow. Opencode's home directories are bind-mounted whole, so everything opencode persists — sessions, CLI settings, plugins, provider credentials — survives container restarts, exactly as if opencode were installed locally. It works standalone, with no native OpenCode install required.
 
 Everything else on the host is **not** in the container (see [Credentials](#credentials)): no shell environment, no other dotfiles, no other CLI configs. What is in there is explicitly opencode's own data — the four directories above, a filtered git identity, the host's CA bundle, and the plugins your configs reference. This is built with a **local model provider** (LM Studio, Ollama, a local proxy) in mind, which typically needs no credentials at all; for those what matters is network reachability: `--add-host=host.docker.internal:host-gateway` is always added (see [How it works](#how-it-works) and [Local providers](#local-providers) for the config change this requires).
